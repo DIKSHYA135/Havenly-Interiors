@@ -39,7 +39,6 @@ jobs:
           cd backend
           npm ci
 
-      # FIX #1: Removed "|| echo" fallback. Failed tests now fail the build.
       - name: Run backend automated test suite
         env:
           MONGODB_URI: mongodb://127.0.0.1:27017/havenly_test_ci
@@ -55,6 +54,15 @@ jobs:
           VITE_API_URL: /api
         run: npm run build
 
+      # Upload the pre-built dist/ so the deploy job can download it
+      # instead of rebuilding on the memory-limited t2.micro EC2 instance.
+      - name: Upload frontend build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist/
+          retention-days: 1
+
   # ─── JOB 2: PROVISION CLOUDFORMATION & DEPLOY TO EC2 ─────────────────────
   deploy:
     name: Provision Infrastructure & Deploy to EC2
@@ -65,7 +73,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # FIX #4: Validate that all required secrets are configured before proceeding.
+      # Download the pre-built frontend from the build job
+      - name: Download frontend build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist/
+
       - name: Validate required secrets
         run: |
           MISSING=""
@@ -92,14 +106,15 @@ jobs:
 
       - name: Deploy CloudFormation Stack (Create or Update EC2)
         id: cfn
-        uses: aws-actions/aws-cloudformation-github-deploy@v2.0.0
-        with:
-          name: ${{ env.STACK_NAME }}
-          template: infra/ec2-instance.yaml
-          fail-on-empty-changeset: false
-          capabilities: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM"
-      # FIX #7: SSH key is written with restrictive permissions, used only by reference,
-      # and deleted in a dedicated always-run cleanup step.
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ env.STACK_NAME }} \
+            --template-file infra/ec2-instance.yaml \
+            --parameter-overrides InstanceType=t2.micro \
+            --no-fail-on-empty-changeset \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --region ${{ env.AWS_REGION }}
+
       - name: Retrieve EC2 Public IP and SSH Key from AWS SSM
         id: get-info
         run: |
@@ -117,7 +132,6 @@ jobs:
             --query "Stacks[0].Outputs[?OutputKey=='SSMKeyPath'].OutputValue" \
             --output text)
 
-          # Write key to a temp file with strict permissions from the start
           umask 077
           aws ssm get-parameter \
             --name "$SSM_PATH" \
@@ -143,12 +157,16 @@ jobs:
           echo "::error::Timed out waiting for SSH on $IP:22 after 6 minutes."
           exit 1
 
-      # FIX #3, #4, #5, #9, #10: Rewrote the entire deployment script.
-      # - No hardcoded default passwords (ADMIN_EMAIL and ADMIN_PASSWORD are required secrets).
-      # - Validates MONGODB_URI and JWT_SECRET are non-empty before writing .env.
-      # - Does not echo secret values into logs.
-      # - Removed dangerous "sudo rm -rf /var/www/app/* /var/www/app/.*" (could match .. and delete parent).
-      # - PM2 startup is explicitly configured for reboot survival.
+      # Upload the pre-built dist/ folder to EC2 via SCP
+      - name: Upload frontend build to EC2
+        run: |
+          IP=${{ steps.get-info.outputs.EC2_IP }}
+          # Compress and upload the pre-built dist folder
+          tar -czf /tmp/dist.tar.gz -C dist .
+          scp -o StrictHostKeyChecking=no -i /tmp/server-key.pem \
+            /tmp/dist.tar.gz ubuntu@$IP:/tmp/dist.tar.gz
+          rm -f /tmp/dist.tar.gz
+
       - name: Deploy Havenly Interiors via SSH
         uses: appleboy/ssh-action@v1.2.0
         env:
@@ -163,14 +181,13 @@ jobs:
           script_stop: true
           envs: MONGODB_URI,JWT_SECRET,ADMIN_EMAIL,ADMIN_PASSWORD
           script: |
-            set -euo pipefail
+            set -eo pipefail
 
             echo ">>> [1/8] Waiting for EC2 user-data initialization..."
             cloud-init status --wait || true
 
             echo ">>> [2/8] Pulling latest code into /var/www/app..."
             if [ ! -d "/var/www/app/.git" ]; then
-              # First deployment: clone into the app directory safely
               sudo rm -rf /var/www/app
               sudo mkdir -p /var/www/app
               sudo chown ubuntu:ubuntu /var/www/app
@@ -186,27 +203,20 @@ jobs:
             npm ci --omit=dev
 
             echo ">>> [4/8] Validating required environment variables..."
-            if [ -z "${MONGODB_URI:-}" ]; then
-              echo "::error::MONGODB_URI is empty. Set it in GitHub Secrets."
-              exit 1
-            fi
-            if [ -z "${JWT_SECRET:-}" ]; then
-              echo "::error::JWT_SECRET is empty. Set it in GitHub Secrets."
-              exit 1
-            fi
-            if [ -z "${ADMIN_EMAIL:-}" ]; then
-              echo "::error::ADMIN_EMAIL is empty. Set it in GitHub Secrets."
-              exit 1
-            fi
-            if [ -z "${ADMIN_PASSWORD:-}" ]; then
-              echo "::error::ADMIN_PASSWORD is empty. Set it in GitHub Secrets."
+            VARS_OK=true
+            if [ -z "${MONGODB_URI:-}" ]; then echo "ERROR: MONGODB_URI is empty."; VARS_OK=false; fi
+            if [ -z "${JWT_SECRET:-}" ]; then echo "ERROR: JWT_SECRET is empty."; VARS_OK=false; fi
+            if [ -z "${ADMIN_EMAIL:-}" ]; then echo "ERROR: ADMIN_EMAIL is empty."; VARS_OK=false; fi
+            if [ -z "${ADMIN_PASSWORD:-}" ]; then echo "ERROR: ADMIN_PASSWORD is empty."; VARS_OK=false; fi
+            if [ "$VARS_OK" = "false" ]; then
+              echo "One or more required secrets are missing. Set them in GitHub Secrets."
               exit 1
             fi
             echo "All required environment variables are present."
 
-            echo ">>> [5/8] Generating backend production .env (secrets are NOT printed)..."
+            echo ">>> [5/8] Generating backend production .env..."
             EC2_IP=$(curl -sf http://169.254.169.254/latest/meta-data/public-ipv4 || echo "localhost")
-            cat > /var/www/app/backend/.env << ENVEOF
+            cat > /var/www/app/backend/.env <<ENVEOF
             PORT=5001
             NODE_ENV=production
             CLIENT_URL=http://${EC2_IP}
@@ -217,7 +227,8 @@ jobs:
             ADMIN_USERNAME=admin
             ADMIN_NAME=Studio Principal
             ENVEOF
-            # Restrict .env file permissions
+            # Strip any leading whitespace from each line (safety measure for YAML heredoc indentation)
+            sed -i 's/^[[:space:]]*//' /var/www/app/backend/.env
             chmod 600 /var/www/app/backend/.env
             echo ".env file written with restricted permissions (600)."
 
@@ -225,10 +236,12 @@ jobs:
             cd /var/www/app/backend
             npm run seed:admin || echo "Admin seeding completed (may already exist)."
 
-            echo ">>> [7/8] Installing frontend dependencies & building production assets..."
-            cd /var/www/app
-            npm ci
-            npm run build
+            echo ">>> [7/8] Deploying pre-built frontend assets..."
+            sudo mkdir -p /var/www/app/dist
+            sudo chown ubuntu:ubuntu /var/www/app/dist
+            tar -xzf /tmp/dist.tar.gz -C /var/www/app/dist
+            rm -f /tmp/dist.tar.gz
+            echo "Frontend dist/ deployed from CI build artifact."
 
             echo ">>> [8/8] Applying Nginx configuration and restarting services..."
             sudo cp /var/www/app/infra/nginx.conf /etc/nginx/sites-available/havenly
@@ -237,29 +250,27 @@ jobs:
             sudo nginx -t
             sudo systemctl reload nginx
 
-            # PM2: Stop previous instance, start fresh, configure reboot survival
             cd /var/www/app/backend
             pm2 delete havenly-backend 2>/dev/null || true
             pm2 start ecosystem.config.cjs --update-env
             pm2 save
 
-            # Ensure PM2 startup hook is registered for the ubuntu user
-            # This makes PM2 resurrect the backend process after every EC2 reboot
-            pm2 startup systemd -u ubuntu --hp /home/ubuntu 2>/dev/null | grep -v "sudo" | tail -1 | bash 2>/dev/null || true
-            sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu 2>/dev/null || true
+            # Register PM2 startup hook for reboot survival (safe with pipefail)
+            PM2_STARTUP_CMD=$(pm2 startup systemd -u ubuntu --hp /home/ubuntu 2>/dev/null | grep "sudo" || true)
+            if [ -n "$PM2_STARTUP_CMD" ]; then
+              eval "$PM2_STARTUP_CMD" 2>/dev/null || true
+            fi
 
-            # Verify backend starts and responds to health check
             echo "Waiting for backend to start..."
             sleep 5
             HEALTH=$(curl -sf http://127.0.0.1:5001/api/health || echo "FAIL")
             if echo "$HEALTH" | grep -q '"success":true'; then
               echo "Internal health check passed: backend and database are connected."
             else
-              echo "::warning::Internal health check did not confirm database connection."
+              echo "WARNING: Internal health check did not confirm database connection."
               echo "Response: $HEALTH"
             fi
 
-      # FIX #2: Health check is now mandatory. Deployment fails if /api/health does not return HTTP 200.
       - name: Verify Public Health Endpoint (MANDATORY)
         run: |
           IP=${{ steps.get-info.outputs.EC2_IP }}
@@ -270,7 +281,7 @@ jobs:
               echo ""
               cat /tmp/health_response.json
               echo ""
-              echo "✅ Public health check returned HTTP 200. Deployment verified!"
+              echo "Public health check returned HTTP 200. Deployment verified!"
               rm -f /tmp/health_response.json
               exit 0
             fi
@@ -284,7 +295,6 @@ jobs:
           rm -f /tmp/health_response.json
           exit 1
 
-      # FIX #7: SSH key cleanup always runs, even if previous steps fail.
       - name: Clean up temporary SSH key
         if: always()
         run: |
@@ -297,7 +307,7 @@ jobs:
         if: success()
         run: |
           IP="${{ steps.get-info.outputs.EC2_IP }}"
-          echo "### 🚀 Havenly Interiors — Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "### Havenly Interiors — Deployment Successful" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource | URL / Details |" >> $GITHUB_STEP_SUMMARY
           echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
@@ -306,4 +316,3 @@ jobs:
           echo "| **API Health Check** | [http://$IP/api/health](http://$IP/api/health) |" >> $GITHUB_STEP_SUMMARY
           echo "| **EC2 Public IPv4** | \`$IP\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **AWS Region** | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Architecture** | React (Vite) → Nginx (:80) → Express (PM2 :5001) → MongoDB Atlas |" >> $GITHUB_STEP_SUMMARY
