@@ -1,0 +1,160 @@
+name: Deploy Havenly Interiors to AWS EC2
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  # ─── JOB 1: BUILD & TEST ──────────────────────────────────────────────────
+  build:
+    name: Build & Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install root dependencies & build frontend
+        run: |
+          npm ci
+          npm run build
+        env:
+          VITE_API_URL: /api
+
+      - name: Verify backend dependencies
+        run: |
+          cd backend
+          npm ci --omit=dev
+
+  # ─── JOB 2: PROVISION INFRASTRUCTURE & DEPLOY APPLICATION ────────────────
+  deploy:
+    name: Provision & Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Deploy CloudFormation Stack
+        id: cfn
+        uses: aws-actions/aws-cloudformation-stack-deploy@v1
+        with:
+          name: havenly-stack
+          template: infra/ec2-instance.yaml
+          no-fail-on-empty-changeset: "1"
+
+      - name: Retrieve EC2 Public IP and SSH Key from AWS SSM
+        id: get-info
+        run: |
+          EC2_IP=$(aws cloudformation describe-stacks \
+            --stack-name havenly-stack \
+            --query "Stacks[0].Outputs[?OutputKey=='PublicIP'].OutputValue" \
+            --output text)
+          echo "EC2_IP=$EC2_IP" >> $GITHUB_OUTPUT
+
+          SSM_PATH=$(aws cloudformation describe-stacks \
+            --stack-name havenly-stack \
+            --query "Stacks[0].Outputs[?OutputKey=='SSMKeyPath'].OutputValue" \
+            --output text)
+
+          aws ssm get-parameter \
+            --name "$SSM_PATH" \
+            --with-decryption \
+            --query "Parameter.Value" \
+            --output text > /tmp/server-key.pem
+
+          chmod 600 /tmp/server-key.pem
+          echo "SSH_KEY_PATH=/tmp/server-key.pem" >> $GITHUB_OUTPUT
+
+      - name: Wait for SSH to become ready
+        run: |
+          echo "Waiting for SSH on ${{ steps.get-info.outputs.EC2_IP }}:22..."
+          for i in {1..30}; do
+            nc -zw5 ${{ steps.get-info.outputs.EC2_IP }} 22 && echo "SSH is ready!" && break
+            echo "Waiting ($i/30)..."
+            sleep 10
+          done
+
+      - name: Deploy Havenly Interiors via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ steps.get-info.outputs.EC2_IP }}
+          username: ubuntu
+          key_path: ${{ steps.get-info.outputs.SSH_KEY_PATH }}
+          script_stop: true
+          script: |
+            # 1. Wait for EC2 bootstrap initialization to complete
+            cloud-init status --wait || true
+
+            # 2. Pull latest code into /var/www/app
+            if [ ! -d "/var/www/app/.git" ]; then
+              sudo rm -rf /var/www/app/* /var/www/app/.* 2>/dev/null || true
+              git clone https://github.com/${{ github.repository }}.git /var/www/app
+            else
+              cd /var/www/app
+              git fetch origin main
+              git reset --hard origin/main
+            fi
+
+            # 3. Install backend dependencies
+            cd /var/www/app/backend
+            npm ci --omit=dev
+
+            # 4. Generate backend production .env
+            cat > /var/www/app/backend/.env << 'EOF'
+            PORT=5001
+            NODE_ENV=production
+            CLIENT_URL=http://${{ steps.get-info.outputs.EC2_IP }}
+            MONGODB_URI=${{ secrets.MONGODB_URI }}
+            JWT_SECRET=${{ secrets.JWT_SECRET }}
+            ADMIN_EMAIL=${{ secrets.ADMIN_EMAIL || 'admin@havenlyinteriors.com' }}
+            ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD || 'AdminHavenly2026!' }}
+            EOF
+
+            # 5. Seed default admin account if not already created
+            npm run seed:admin || true
+
+            # 6. Install root dependencies and build production React/Vite frontend
+            cd /var/www/app
+            npm ci
+            npm run build
+
+            # 7. Apply Nginx configuration and reload web server
+            sudo cp /var/www/app/infra/nginx.conf /etc/nginx/sites-available/havenly
+            sudo ln -sf /etc/nginx/sites-available/havenly /etc/nginx/sites-enabled/default
+            sudo nginx -t
+            sudo systemctl reload nginx
+
+            # 8. Start/Restart backend service via PM2 and save state
+            cd /var/www/app/backend
+            pm2 delete all 2>/dev/null || true
+            pm2 start ecosystem.config.cjs --update-env
+            pm2 save
+
+      - name: Clean up local SSH key
+        if: always()
+        run: |
+          rm -f /tmp/server-key.pem
+
+      - name: Deployment Summary
+        run: |
+          echo "### 🚀 Havenly Interiors Live Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Live Website URL:** http://${{ steps.get-info.outputs.EC2_IP }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Health Endpoint:** http://${{ steps.get-info.outputs.EC2_IP }}/api/health" >> $GITHUB_STEP_SUMMARY
+          echo "- **Admin Dashboard:** http://${{ steps.get-info.outputs.EC2_IP }}/admin" >> $GITHUB_STEP_SUMMARY
+          echo "- **Server IP:** \`${{ steps.get-info.outputs.EC2_IP }}\`" >> $GITHUB_STEP_SUMMARY

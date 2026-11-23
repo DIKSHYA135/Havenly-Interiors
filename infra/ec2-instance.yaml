@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Havenly Interiors Full-Stack Infrastructure (EC2 + SSM KeyPair + Security Group)
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type (t2.micro is free-tier eligible)
+
+  UbuntuAMI:
+    Type: String
+    Default: ami-0e86e20dae9224db8
+    Description: Ubuntu 24.04 LTS AMI in us-east-1
+
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Allow SSH from anywhere for GitHub Actions runners
+
+Resources:
+  # 1. SSH KeyPair automatically saved to AWS Systems Manager Parameter Store
+  ServerKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "${AWS::StackName}-key"
+
+  # 2. Security Group opening Port 80 (HTTP) and Port 22 (SSH)
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH traffic for Havenly Interiors
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+
+  # 3. Ubuntu Virtual Machine with Startup Bootstrap (UserData)
+  ServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref ServerKeyPair
+      SecurityGroupIds:
+        - !GetAtt ServerSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-server"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          exec > /var/log/userdata.log 2>&1
+
+          # Update system & install Node.js 22, Git, Nginx, and PM2
+          apt-get update -y
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+          apt-get install -y nodejs nginx git
+          npm install -g pm2
+
+          # Create app directory with proper ownership
+          mkdir -p /var/www/app
+          chown -R ubuntu:ubuntu /var/www/app
+
+          # Enable Nginx
+          systemctl enable nginx
+          systemctl start nginx
+
+          # Enable PM2 startup systemd service for ubuntu user
+          sudo -u ubuntu pm2 startup systemd -u ubuntu --hp /home/ubuntu | tail -1 | bash
+
+Outputs:
+  PublicIP:
+    Description: Public IP of the Havenly Interiors server
+    Value: !GetAtt ServerInstance.PublicIp
+
+  PublicURL:
+    Description: Live Web Application URL
+    Value: !Sub "http://${ServerInstance.PublicIp}"
+
+  SSMKeyPath:
+    Description: Systems Manager Parameter Store path for the private SSH key
+    Value: !Sub "/ec2/keypair/${ServerKeyPair.KeyPairId}"
