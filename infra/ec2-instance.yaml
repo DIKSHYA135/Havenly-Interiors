@@ -1,45 +1,105 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Havenly Interiors Full-Stack Infrastructure (EC2 + SSM KeyPair + Security Group)
+Description: Havenly Interiors Full-Stack Production Infrastructure (EC2 + SSM KeyPair + Security Group + Nginx + PM2)
 
 Parameters:
   InstanceType:
     Type: String
     Default: t2.micro
-    Description: EC2 instance type (t2.micro is free-tier eligible)
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type (t2.micro and t3.micro are Free Tier eligible).
 
   UbuntuAMI:
-    Type: String
-    Default: ami-0e86e20dae9224db8
-    Description: Ubuntu 24.04 LTS AMI in us-east-1
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id'
+    Description: Automatically resolves the latest official Ubuntu 24.04 LTS AMI in whatever AWS region the stack is launched in.
 
   SSHLocation:
     Type: String
     Default: 0.0.0.0/0
-    Description: Allow SSH from anywhere for GitHub Actions runners
+    Description: Allowed CIDR block for SSH access (default 0.0.0.0/0 allows GitHub Actions deployment runners).
+
+  CreateIAMRole:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Set to 'true' if your AWS account has IAM creation permissions (adds SSM Session Manager role). Keep 'false' if using AWS Academy / Learner Lab.
+
+Conditions:
+  ShouldCreateIAMRole: !Equals [!Ref CreateIAMRole, 'true']
 
 Resources:
-  # 1. SSH KeyPair automatically saved to AWS Systems Manager Parameter Store
+  # ----------------------------------------------------------------------------
+  # 1. SSH KeyPair automatically saved to AWS Systems Manager (SSM) Parameter Store
+  # ----------------------------------------------------------------------------
   ServerKeyPair:
     Type: AWS::EC2::KeyPair
     Properties:
       KeyName: !Sub "${AWS::StackName}-key"
 
-  # 2. Security Group opening Port 80 (HTTP) and Port 22 (SSH)
+  # ----------------------------------------------------------------------------
+  # 2. Security Group opening Port 80 (HTTP), Port 443 (HTTPS), and Port 22 (SSH)
+  # ----------------------------------------------------------------------------
   ServerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP and SSH traffic for Havenly Interiors
+      GroupDescription: Security Group for Havenly Interiors full-stack web application
       SecurityGroupIngress:
+        # HTTP - Public Web Traffic
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
+        # HTTPS - Secure Web Traffic
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        # SSH - Server Access & GitHub Actions Deployment
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           CidrIp: !Ref SSHLocation
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
 
-  # 3. Ubuntu Virtual Machine with Startup Bootstrap (UserData)
+  # ----------------------------------------------------------------------------
+  # 3. Optional IAM Role & Instance Profile for AWS Systems Manager (SSM)
+  # ----------------------------------------------------------------------------
+  ServerInstanceRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateIAMRole
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  ServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: ShouldCreateIAMRole
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-instance-profile"
+      Roles:
+        - !Ref ServerInstanceRole
+
+  # ----------------------------------------------------------------------------
+  # 4. Ubuntu 24.04 Virtual Machine with Automated Bootstrap UserData
+  # ----------------------------------------------------------------------------
   ServerInstance:
     Type: AWS::EC2::Instance
     Properties:
@@ -48,35 +108,48 @@ Resources:
       KeyName: !Ref ServerKeyPair
       SecurityGroupIds:
         - !GetAtt ServerSecurityGroup.GroupId
+      IamInstanceProfile: !If [ShouldCreateIAMRole, !Ref ServerInstanceProfile, !Ref "AWS::NoValue"]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-server"
+        - Key: Application
+          Value: HavenlyInteriors
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -e
           exec > /var/log/userdata.log 2>&1
 
-          # Update system & install Node.js 22, Git, Nginx, and PM2
+          echo ">>> [1/5] Updating packages and installing Node.js 22 LTS, Git, and Nginx..."
           apt-get update -y
           curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-          apt-get install -y nodejs nginx git
+          apt-get install -y nodejs nginx git curl ufw
+
+          echo ">>> [2/5] Installing PM2 Process Manager globally..."
           npm install -g pm2
 
-          # Create app directory with proper ownership
+          echo ">>> [3/5] Setting up web application root directory..."
           mkdir -p /var/www/app
           chown -R ubuntu:ubuntu /var/www/app
 
-          # Enable Nginx
+          echo ">>> [4/5] Enabling Nginx web server..."
           systemctl enable nginx
           systemctl start nginx
 
-          # Enable PM2 startup systemd service for ubuntu user
-          sudo -u ubuntu pm2 startup systemd -u ubuntu --hp /home/ubuntu | tail -1 | bash
+          echo ">>> [5/5] Configuring PM2 to launch on system boot for ubuntu user..."
+          sudo -u ubuntu pm2 startup systemd -u ubuntu --hp /home/ubuntu | tail -1 | bash || true
+
+          echo ">>> Havenly Interiors EC2 instance initialization complete!"
 
 Outputs:
   PublicIP:
-    Description: Public IP of the Havenly Interiors server
+    Description: Public IPv4 address of the Havenly Interiors EC2 server
     Value: !GetAtt ServerInstance.PublicIp
 
   PublicURL:
@@ -84,5 +157,9 @@ Outputs:
     Value: !Sub "http://${ServerInstance.PublicIp}"
 
   SSMKeyPath:
-    Description: Systems Manager Parameter Store path for the private SSH key
+    Description: AWS Systems Manager Parameter Store path for the private SSH key
     Value: !Sub "/ec2/keypair/${ServerKeyPair.KeyPairId}"
+
+  SecurityGroupId:
+    Description: Security Group ID for the web server
+    Value: !GetAtt ServerSecurityGroup.GroupId
