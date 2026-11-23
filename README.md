@@ -36,183 +36,184 @@ Deployed to **Amazon Web Services (AWS) EC2** using **AWS CloudFormation (Infras
 ```
 
 ### Key Architectural Layers:
-1. **Frontend (React + Vite SPA):** Served directly by Nginx from `/var/www/app/dist` for instant static delivery and client-side routing.
-2. **Backend API (Node.js + Express):** Runs internally on port `5001` managed by PM2. Handles inquiries, consultation bookings, and JWT-authenticated admin operations.
-3. **Reverse Proxy (Nginx):** Public entry point on Port 80 (and 443). Routes `/` to the React build and reverse-proxies `/api/` to Express.
-4. **Cloud Database (MongoDB Atlas):** Independent, 24/7 managed cloud database. Data is never lost even if the EC2 instance restarts or stops.
-5. **CI/CD Pipeline (GitHub Actions):** Automatically tests, builds, provisions AWS infrastructure with CloudFormation, and deploys new code on every git push to `main`.
+1. **Frontend (React + Vite SPA):** Served by Nginx from `/var/www/app/dist` with client-side SPA routing fallback.
+2. **Backend API (Node.js + Express):** Runs internally on port `5001`, managed by PM2 with automatic restart and reboot survival.
+3. **Reverse Proxy (Nginx):** Public entry point on Port 80. Routes `/` to the React build and reverse-proxies `/api/` to Express on `127.0.0.1:5001`. Port 5001 is **never** exposed to the internet.
+4. **Cloud Database (MongoDB Atlas):** Independent, 24/7 managed cloud database. Data persists across EC2 reboots and redeployments.
+5. **CI/CD Pipeline (GitHub Actions):** Automatically tests, builds, provisions AWS infrastructure with CloudFormation, deploys code via SSH, and **fails the deployment** if the health check does not pass.
 
 ---
 
-## 💰 AWS Cost & Free Tier Analysis (Estimated Costs)
+## 💰 AWS Cost & Free Tier Analysis
 
-Before provisioning resources, here is the transparent cost analysis:
-
-| AWS Resource | Configuration | AWS Free Tier Eligibility | Estimated Cost |
+| AWS Resource | Configuration | Free Tier | Estimated Cost |
 | :--- | :--- | :--- | :--- |
-| **Amazon EC2** | `t2.micro` (1 vCPU, 1 GB RAM) | **750 hours/month free** for first 12 months | **$0.00** (Free Tier)<br>*(~$8.35/mo outside free tier)* |
-| **EBS Storage** | 20 GB gp3 SSD | **30 GB/month free** | **$0.00** (Free Tier) |
-| **Data Transfer** | Outbound HTTP/HTTPS | **100 GB/month free** from AWS | **$0.00** |
-| **CloudFormation** | Stacks and change sets | **100% Free** (No charge for CloudFormation itself) | **$0.00** |
-| **SSM Parameter Store** | KeyPair storage (Standard) | **10,000 parameters free** | **$0.00** |
-| **MongoDB Atlas** | M0 Shared Cluster | **100% Free Forever** (512 MB storage, shared RAM) | **$0.00** |
-| **GitHub Actions** | CI/CD Runner | **Unlimited free** for public repos (2,000 mins/mo private) | **$0.00** |
-| **TOTAL ESTIMATED COST** | Full-Stack Production | **Free Tier Eligible** | **$0.00 / month** |
+| **Amazon EC2** | `t2.micro` (1 vCPU, 1 GB RAM) | 750 hrs/month free (12 months) | **$0.00** |
+| **EBS Storage** | 20 GB gp3 SSD | 30 GB/month free | **$0.00** |
+| **Data Transfer** | Outbound HTTP/HTTPS | 100 GB/month free | **$0.00** |
+| **CloudFormation** | Stack management | Always free | **$0.00** |
+| **SSM Parameter Store** | SSH key storage (Standard tier) | 10,000 parameters free | **$0.00** |
+| **MongoDB Atlas** | M0 Shared Cluster | Free forever (512 MB) | **$0.00** |
+| **GitHub Actions** | CI/CD Runner | Unlimited for public repos | **$0.00** |
+| **TOTAL** | | **Free Tier eligible** | **$0.00 / month** |
 
 ---
 
-## 📁 Infrastructure Files Overview
+## 📁 Infrastructure Files
 
-Your project contains 4 dedicated infrastructure files created specifically for Havenly Interiors:
-
-| File Path | Purpose |
+| File | Purpose |
 | :--- | :--- |
-| [`infra/ec2-instance.yaml`](file:///Users/dikshyashreesh/Desktop/Havenly%20interior/infra/ec2-instance.yaml) | CloudFormation template that provisions the EC2 instance, security group (Ports 80, 443, 22), automated KeyPair in SSM Parameter Store, and instance bootstrap UserData. |
-| [`infra/nginx.conf`](file:///Users/dikshyashreesh/Desktop/Havenly%20interior/infra/nginx.conf) | Production Nginx web server configuration with SPA routing fallback, `/api/` reverse proxying to `5001`, `/uploads/` proxy, gzip compression, and security headers. |
-| [`backend/ecosystem.config.cjs`](file:///Users/dikshyashreesh/Desktop/Havenly%20interior/backend/ecosystem.config.cjs) | PM2 configuration file for the Express backend running on internal port `5001` with `exec_mode: 'fork'` (optimized for single-core `t2.micro`). |
-| [`.github/workflows/deploy.yml`](file:///Users/dikshyashreesh/Desktop/Havenly%20interior/.github/workflows/deploy.yml) | GitHub Actions CI/CD pipeline that builds, tests, provisions CloudFormation, connects via SSH, deploys code, and verifies health. |
+| `infra/ec2-instance.yaml` | CloudFormation template: EC2 instance, security group (Ports 80, 443, 22), SSH KeyPair in SSM, and bootstrap UserData. |
+| `infra/nginx.conf` | Nginx configuration: SPA routing, `/api/` reverse proxy to port 5001, gzip, security headers. |
+| `backend/ecosystem.config.cjs` | PM2 configuration: Express on port 5001, fork mode, auto-restart, exponential backoff. |
+| `.github/workflows/deploy.yml` | GitHub Actions CI/CD: build, test, provision CloudFormation, deploy via SSH, mandatory health verification. |
 
 ---
 
 ## 🛠️ Step-by-Step Production Deployment Guide
 
-Follow these 5 beginner-friendly steps to launch your application on AWS:
-
 ### Step 1: Set Up MongoDB Atlas (Cloud Database)
-1. Sign up for a free account at [mongodb.com/cloud/atlas](https://www.mongodb.com/cloud/atlas).
+
+1. Sign up at [mongodb.com/cloud/atlas](https://www.mongodb.com/cloud/atlas) (free).
 2. Create a free **M0 cluster**.
-3. Under **Security > Database Access**, create a user (e.g. `havenly_user` with a secure password). Grant **Read and write to any database**.
-4. Under **Security > Network Access**, click **Add IP Address** > choose **Allow Access from Anywhere** (`0.0.0.0/0`) > click **Confirm**.
-5. Under **Deployment > Database**, click **Connect** > choose **Drivers** (Node.js).
-6. Copy the connection string and format it with your database name `havenly_interiors`:
+3. Under **Security > Database Access**, create a database user with **Read and write to any database**.
+4. Under **Security > Network Access**, add the EC2 instance's public IP address (or `0.0.0.0/0` temporarily during initial setup — **restrict this after deployment**).
+5. Under **Deployment > Database**, click **Connect** > **Drivers** (Node.js) and copy the connection string:
    ```text
-   mongodb+srv://havenly_user:YOUR_PASSWORD@cluster0.abcde.mongodb.net/havenly_interiors?retryWrites=true&w=majority
+   mongodb+srv://YOUR_USER:YOUR_PASSWORD@cluster0.xxxxx.mongodb.net/havenly_interiors?retryWrites=true&w=majority
    ```
+
+> [!IMPORTANT]
+> **MongoDB Atlas Network Access:** Using `0.0.0.0/0` (allow from anywhere) is acceptable for initial setup and AWS Learner Lab (where EC2 IPs change). For long-term production, restrict Network Access to your EC2 instance's public IP address. You can find the IP in the GitHub Actions deployment summary or in the AWS EC2 console.
 
 ---
 
 ### Step 2: Retrieve Your AWS Credentials
 
 #### If using AWS Academy / Learner Lab:
-1. Start your lab session in AWS Learner Lab.
+1. Start your lab session.
 2. Click **AWS Details** > **Show** (next to AWS CLI).
-3. Copy:
-   - `aws_access_key_id`
-   - `aws_secret_access_key`
-   - `aws_session_token`
+3. Copy the three values: `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`.
 
 #### If using a Standard Personal AWS Account:
-1. Log into the AWS Console > IAM > Users > Security credentials.
-2. Create an **Access key** for CLI/Application use outside AWS.
+1. Go to AWS Console > IAM > Users > Security credentials.
+2. Create an **Access key** for CLI use.
 3. Copy your `Access Key ID` and `Secret Access Key`.
 
 ---
 
-### Step 3: Configure GitHub Repository Secrets & Variables
+### Step 3: Configure GitHub Repository Secrets & Variables (ALL REQUIRED)
 
-1. Go to your GitHub repository: [`https://github.com/DIKSHYA135/Havenly-Interiors`](https://github.com/DIKSHYA135/Havenly-Interiors).
-2. Navigate to **Settings > Secrets and variables > Actions**.
-3. Under the **Secrets** tab, click **New repository secret** and add:
+Go to your GitHub repository **Settings > Secrets and variables > Actions**.
 
-| Secret Name | Value | Description |
+Under the **Secrets** tab, add **all** of the following:
+
+| Secret Name | Required | Description |
 | :--- | :--- | :--- |
-| `AWS_ACCESS_KEY_ID` | `AKIA...` or `ASIA...` | Your AWS access key |
-| `AWS_SECRET_ACCESS_KEY` | Your secret access key string | Your AWS secret key |
-| `AWS_SESSION_TOKEN` | Your session token string | Required for AWS Learner Lab (omit for standard accounts) |
-| `MONGODB_URI` | `mongodb+srv://havenly_user:...` | Full connection URI from Step 1 |
-| `JWT_SECRET` | Secure 32+ char random string | Secret for signing admin JWT tokens |
-| `ADMIN_EMAIL` | `admin@havenlyinteriors.com` | Default admin email login |
-| `ADMIN_PASSWORD` | `AdminHavenly2026!` | Default admin password |
+| `AWS_ACCESS_KEY_ID` | **Yes** | Your AWS access key ID |
+| `AWS_SECRET_ACCESS_KEY` | **Yes** | Your AWS secret access key |
+| `AWS_SESSION_TOKEN` | Learner Lab only | Your AWS session token (omit for standard accounts) |
+| `MONGODB_URI` | **Yes** | Full MongoDB Atlas connection string (see Step 1) |
+| `JWT_SECRET` | **Yes** | A secure random string, 32+ characters (used to sign admin JWT tokens) |
+| `ADMIN_EMAIL` | **Yes** | Admin login email (e.g. `admin@havenlyinteriors.com`) |
+| `ADMIN_PASSWORD` | **Yes** | Admin login password (choose a strong password) |
 
-4. Under the **Variables** tab (next to *Secrets*), click **New repository variable**:
-   - **Name:** `AWS_REGION`
-   - **Value:** `us-east-1` (or your chosen AWS region)
+> [!CAUTION]
+> The deployment workflow **will fail** if `MONGODB_URI`, `JWT_SECRET`, `ADMIN_EMAIL`, or `ADMIN_PASSWORD` are missing. There are no hardcoded defaults. You must set all required secrets before deploying.
+
+Under the **Variables** tab, add:
+- **Name:** `AWS_REGION` — **Value:** `us-east-1` (or your chosen region)
 
 ---
 
-### Step 4: Push to GitHub & Deploy Automatically
-
-Commit and push your changes to trigger the automated CI/CD pipeline:
+### Step 4: Push to GitHub & Deploy
 
 ```bash
-# Verify status and staging
 git add .
-git commit -m "feat(aws): configure full-stack CloudFormation, Nginx, PM2, and CI/CD"
+git commit -m "feat(aws): production deployment with CI/CD"
 git push origin main
 ```
+
+The GitHub Actions workflow will automatically:
+1. Run backend tests against a CI MongoDB container.
+2. Build the React/Vite frontend.
+3. Validate that all required secrets are configured.
+4. Provision or update the CloudFormation stack (EC2 + security group + SSH key).
+5. SSH into EC2, pull code, install dependencies, write `.env`, seed admin, build frontend.
+6. Configure Nginx and start the backend via PM2.
+7. **Verify the public `/api/health` endpoint returns HTTP 200** — deployment fails if it does not.
 
 ---
 
 ### Step 5: Verify Live Application
 
 1. Open the **Actions** tab on your GitHub repository.
-2. Click on the running workflow **Deploy Havenly Interiors to AWS EC2**.
-3. Once completed (approx. 3–4 minutes for the first run), scroll down to the **Deployment Summary**:
+2. Click on the completed workflow run.
+3. The **Deployment Summary** shows your live URLs:
    - **Live Website:** `http://<EC2-PUBLIC-IP>`
    - **Admin Dashboard:** `http://<EC2-PUBLIC-IP>/admin`
    - **Health Check:** `http://<EC2-PUBLIC-IP>/api/health`
-4. Test the live consultation booking form on the homepage.
-5. Log into the Admin Dashboard at `http://<EC2-PUBLIC-IP>/admin` to verify that your consultation submissions appear in real time.
 
 ---
 
-## 🔄 How to Update Your Website in the Future
+## 🔄 How to Update Your Website
 
-Whenever you make improvements, add new portfolio projects, or change styling:
-1. Make your edits locally.
-2. Test locally using `npm run dev` and `npm run build`.
-3. Commit and push:
+1. Make edits locally and test with `npm run dev`.
+2. Commit and push:
    ```bash
    git add .
-   git commit -m "Update portfolio showcase and services"
+   git commit -m "Update portfolio and services"
    git push origin main
    ```
-4. GitHub Actions will automatically rebuild the frontend, test the backend, connect to EC2 via SSH, update the code, and reload PM2 with zero downtime.
+3. GitHub Actions automatically rebuilds, deploys, and verifies the health check.
 
 ---
 
-## 🔧 Live Server Maintenance & Useful Commands
-
-If you ever SSH into the EC2 instance:
+## 🔧 Live Server Maintenance Commands
 
 ```bash
-# Check PM2 backend status
+# PM2 status and logs
 pm2 status
-
-# View live backend application logs
 pm2 logs havenly-backend
 
-# Restart the Express backend
+# Restart backend
 pm2 restart havenly-backend
 
-# Check Nginx status
+# Nginx status and config test
 sudo systemctl status nginx
-
-# Test Nginx configuration syntax
 sudo nginx -t
 
-# View Nginx access & error logs
+# View Nginx logs
 sudo tail -f /var/log/nginx/error.log
 sudo tail -f /var/log/nginx/access.log
 ```
 
 ---
 
-## 🔒 Security Best Practices Implemented
+## 🔒 Security Practices
 
-- **No Hardcoded Secrets:** `.env` files are excluded in `.gitignore`. Secrets are injected at runtime via GitHub Secrets.
-- **SSM Parameter Store KeyPair:** The EC2 private SSH key is generated by AWS CloudFormation and stored directly in AWS Systems Manager Parameter Store. No private `.pem` keys are checked into source control.
-- **Reverse Proxy Shield:** Port 5001 is kept private to internal localhost (`127.0.0.1:5001`). External users only access Port 80 / 443 through Nginx.
-- **Rate Limiting & Helmet:** Backend API requests are rate-limited, sanitized, and secured with HTTP security headers.
-- **CORS Protection:** Express only accepts requests from configured client origins.
+- **No hardcoded secrets.** All credentials are injected via GitHub Secrets at deploy time. The `.env` file is created on EC2 with `chmod 600` and is excluded from git via `.gitignore`.
+- **SSH keys are ephemeral.** The private key is retrieved from AWS SSM Parameter Store during deployment, used once, and securely deleted (`shred`) in an always-run cleanup step.
+- **Port 5001 is not exposed.** The EC2 security group only opens ports 80 (HTTP), 443 (HTTPS), and 22 (SSH). Express is accessed only via Nginx reverse proxy on `127.0.0.1`.
+- **Backend protections:** Rate limiting, Helmet security headers, CORS origin validation, bcrypt password hashing, JWT authentication.
+- **MongoDB Atlas access:** Restrict Network Access to your EC2 public IP after initial deployment (do not leave `0.0.0.0/0` permanently in production).
 
 ---
 
 ## 🛑 How to Avoid Unnecessary AWS Charges
 
-When you are done testing or no longer need the EC2 instance running:
-- **To pause charges:** In the AWS EC2 Console, select your instance > **Instance state** > **Stop instance**. (You will only be billed pennies for the EBS disk).
-- **To completely delete all AWS resources:**
-  1. Go to the **CloudFormation** console.
-  2. Select the stack `havenly-stack`.
-  3. Click **Delete**. This will terminate the EC2 instance, delete the security group, and remove the key pair.
+- **Pause:** In EC2 Console, select your instance > **Instance state** > **Stop instance**.
+- **Delete everything:** In CloudFormation Console, select `havenly-stack` > **Delete**. This terminates the EC2 instance, deletes the security group, and removes the SSH key pair.
+
+---
+
+## 🔧 Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+| :--- | :--- | :--- |
+| Workflow fails at "Validate required secrets" | Missing GitHub Secrets | Add all required secrets in Settings > Secrets |
+| Health check fails after deployment | MongoDB Atlas unreachable from EC2 | Add EC2 public IP (or `0.0.0.0/0`) to Atlas Network Access |
+| `502 Bad Gateway` on the live site | Backend crashed or not running | SSH in and run `pm2 logs havenly-backend` to check errors |
+| SSH timeout during deployment | EC2 still initializing | Re-run the workflow; first boot takes a few minutes |
+| Tests fail in CI | Backend code or test issues | Fix locally, run `npm run test:backend` with a local MongoDB |
+| AWS credentials expired (Learner Lab) | Lab session timed out | Restart lab, copy new credentials, update GitHub Secrets |

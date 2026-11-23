@@ -1,5 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Havenly Interiors Full-Stack Production Infrastructure (EC2 + SSM KeyPair + Security Group + Nginx + PM2)
+Description: >-
+  Havenly Interiors Full-Stack Production Infrastructure.
+  Provisions an Ubuntu 24.04 LTS EC2 instance with Nginx, Node.js 22, PM2,
+  a Security Group (HTTP/HTTPS/SSH), and an auto-generated SSH KeyPair stored
+  in AWS Systems Manager Parameter Store.
 
 Parameters:
   InstanceType:
@@ -9,33 +13,30 @@ Parameters:
       - t2.micro
       - t3.micro
       - t3.small
-      - t3.medium
-    Description: EC2 instance type (t2.micro and t3.micro are Free Tier eligible).
+    Description: >-
+      EC2 instance type. t2.micro and t3.micro are AWS Free Tier eligible
+      (750 hours/month for the first 12 months).
 
   UbuntuAMI:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: '/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id'
-    Description: Automatically resolves the latest official Ubuntu 24.04 LTS AMI in whatever AWS region the stack is launched in.
+    Description: >-
+      Automatically resolves the latest official Ubuntu 24.04 LTS AMI
+      in whatever AWS region the stack is launched in.
 
   SSHLocation:
     Type: String
     Default: 0.0.0.0/0
-    Description: Allowed CIDR block for SSH access (default 0.0.0.0/0 allows GitHub Actions deployment runners).
-
-  CreateIAMRole:
-    Type: String
-    Default: 'false'
-    AllowedValues:
-      - 'true'
-      - 'false'
-    Description: Set to 'true' if your AWS account has IAM creation permissions (adds SSM Session Manager role). Keep 'false' if using AWS Academy / Learner Lab.
-
-Conditions:
-  ShouldCreateIAMRole: !Equals [!Ref CreateIAMRole, 'true']
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    ConstraintDescription: Must be a valid CIDR block (e.g. 203.0.113.0/24 or 0.0.0.0/0).
+    Description: >-
+      CIDR block allowed to SSH into the instance. Default 0.0.0.0/0 is
+      required for GitHub Actions runners (dynamic IPs). For tighter security,
+      restrict to your known IP range after initial deployment.
 
 Resources:
   # ----------------------------------------------------------------------------
-  # 1. SSH KeyPair automatically saved to AWS Systems Manager (SSM) Parameter Store
+  # 1. SSH KeyPair — private key auto-saved to SSM Parameter Store
   # ----------------------------------------------------------------------------
   ServerKeyPair:
     Type: AWS::EC2::KeyPair
@@ -43,24 +44,28 @@ Resources:
       KeyName: !Sub "${AWS::StackName}-key"
 
   # ----------------------------------------------------------------------------
-  # 2. Security Group opening Port 80 (HTTP), Port 443 (HTTPS), and Port 22 (SSH)
+  # 2. Security Group — only the ports that are needed
   # ----------------------------------------------------------------------------
   ServerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security Group for Havenly Interiors full-stack web application
+      GroupDescription: >-
+        Havenly Interiors web server security group.
+        Port 80 (HTTP) and 443 (HTTPS) are open to the public.
+        Port 22 (SSH) is restricted to the SSHLocation CIDR.
+        Port 5001 (Express) is NOT exposed; Nginx reverse-proxies internally.
       SecurityGroupIngress:
-        # HTTP - Public Web Traffic
+        # HTTP — public web traffic
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
-        # HTTPS - Secure Web Traffic
+        # HTTPS — public secure web traffic
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
-        # SSH - Server Access & GitHub Actions Deployment
+        # SSH — deployment & maintenance access only
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
@@ -70,35 +75,7 @@ Resources:
           Value: !Sub "${AWS::StackName}-sg"
 
   # ----------------------------------------------------------------------------
-  # 3. Optional IAM Role & Instance Profile for AWS Systems Manager (SSM)
-  # ----------------------------------------------------------------------------
-  ServerInstanceRole:
-    Type: AWS::IAM::Role
-    Condition: ShouldCreateIAMRole
-    Properties:
-      RoleName: !Sub "${AWS::StackName}-ec2-role"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - ec2.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-
-  ServerInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Condition: ShouldCreateIAMRole
-    Properties:
-      InstanceProfileName: !Sub "${AWS::StackName}-instance-profile"
-      Roles:
-        - !Ref ServerInstanceRole
-
-  # ----------------------------------------------------------------------------
-  # 4. Ubuntu 24.04 Virtual Machine with Automated Bootstrap UserData
+  # 3. EC2 Instance — Ubuntu 24.04 with automated bootstrap
   # ----------------------------------------------------------------------------
   ServerInstance:
     Type: AWS::EC2::Instance
@@ -108,7 +85,6 @@ Resources:
       KeyName: !Ref ServerKeyPair
       SecurityGroupIds:
         - !GetAtt ServerSecurityGroup.GroupId
-      IamInstanceProfile: !If [ShouldCreateIAMRole, !Ref ServerInstanceProfile, !Ref "AWS::NoValue"]
       BlockDeviceMappings:
         - DeviceName: /dev/sda1
           Ebs:
@@ -126,40 +102,40 @@ Resources:
           set -e
           exec > /var/log/userdata.log 2>&1
 
-          echo ">>> [1/5] Updating packages and installing Node.js 22 LTS, Git, and Nginx..."
+          echo ">>> [1/5] Updating system packages and installing Node.js 22 LTS, Git, Nginx..."
           apt-get update -y
           curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-          apt-get install -y nodejs nginx git curl ufw
+          apt-get install -y nodejs nginx git curl
 
-          echo ">>> [2/5] Installing PM2 Process Manager globally..."
+          echo ">>> [2/5] Installing PM2 process manager globally..."
           npm install -g pm2
 
-          echo ">>> [3/5] Setting up web application root directory..."
+          echo ">>> [3/5] Creating web application directory..."
           mkdir -p /var/www/app
           chown -R ubuntu:ubuntu /var/www/app
 
-          echo ">>> [4/5] Enabling Nginx web server..."
+          echo ">>> [4/5] Enabling and starting Nginx..."
           systemctl enable nginx
           systemctl start nginx
 
-          echo ">>> [5/5] Configuring PM2 to launch on system boot for ubuntu user..."
-          sudo -u ubuntu pm2 startup systemd -u ubuntu --hp /home/ubuntu | tail -1 | bash || true
+          echo ">>> [5/5] Configuring PM2 startup service for ubuntu user..."
+          sudo -u ubuntu bash -c 'pm2 startup systemd -u ubuntu --hp /home/ubuntu 2>/dev/null | grep "sudo" | bash' || true
 
-          echo ">>> Havenly Interiors EC2 instance initialization complete!"
+          echo ">>> EC2 instance initialization complete."
 
 Outputs:
   PublicIP:
-    Description: Public IPv4 address of the Havenly Interiors EC2 server
+    Description: Public IPv4 address of the EC2 instance
     Value: !GetAtt ServerInstance.PublicIp
 
   PublicURL:
-    Description: Live Web Application URL
+    Description: Live website URL
     Value: !Sub "http://${ServerInstance.PublicIp}"
 
   SSMKeyPath:
-    Description: AWS Systems Manager Parameter Store path for the private SSH key
+    Description: SSM Parameter Store path for the private SSH key
     Value: !Sub "/ec2/keypair/${ServerKeyPair.KeyPairId}"
 
   SecurityGroupId:
-    Description: Security Group ID for the web server
+    Description: Security Group ID
     Value: !GetAtt ServerSecurityGroup.GroupId
