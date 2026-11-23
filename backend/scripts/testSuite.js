@@ -2,7 +2,7 @@
  * Havenly Interiors — Full-Stack Verification & Automated Test Suite
  * Tests actual MongoDB persistence via Mongoose, validation, authentication, and CRUD endpoints.
  */
-
+import Admin from '../models/Admin.js';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -48,6 +48,40 @@ async function runTests() {
   }
 
   try {
+    const testAdminUsername = (
+      process.env.ADMIN_USERNAME || 'admin'
+    ).trim().toLowerCase();
+
+    const testAdminEmail = (
+      process.env.ADMIN_EMAIL || 'test@havenlyinteriors.com'
+    ).trim().toLowerCase();
+
+    const testAdminPassword =
+      process.env.ADMIN_PASSWORD || 'HavenlyLuxe2026!';
+
+    let testAdmin = await Admin.findOne({
+      $or: [
+        { username: testAdminUsername },
+        { email: testAdminEmail },
+      ],
+    });
+
+    if (!testAdmin) {
+      testAdmin = new Admin({
+        username: testAdminUsername,
+        email: testAdminEmail,
+        password: testAdminPassword,
+        fullName: 'CI Test Admin',
+        role: 'superadmin',
+      });
+    } else {
+      testAdmin.password = testAdminPassword;
+    }
+
+    await testAdmin.save();
+
+    console.log('✅ Test admin account is ready.');
+
     // -------------------------------------------------------------------------
     // 1. Root & Health Check Endpoints
     // -------------------------------------------------------------------------
@@ -176,7 +210,10 @@ async function runTests() {
       const res = await simulateRequest(app, {
         method: 'POST',
         url: '/api/admin/login',
-        body: { identifier: 'admin', password: 'WrongPassword123!' },
+        body: {
+          identifier: testAdminUsername,
+          password: 'WrongPassword123!',
+        },
       });
       assert(res.status === 401, 'Rejects invalid password with 401 Unauthorized');
     }
@@ -186,11 +223,17 @@ async function runTests() {
       const res = await simulateRequest(app, {
         method: 'POST',
         url: '/api/admin/login',
-        body: { identifier: 'admin', password: 'HavenlyLuxe2026!' },
+        body: {
+          identifier: testAdminUsername,
+          password: testAdminPassword,
+        },
       });
       assert(res.status === 200, 'Accepts valid credentials with 200 OK');
       assert(res.body.token !== undefined, 'Returns JWT session token');
-      assert(res.body.admin?.username === 'admin', 'Returns admin user profile');
+      assert(
+        res.body.admin?.username === testAdminUsername,
+        'Returns admin user profile'
+      );
       adminToken = res.body.token;
     }
 
@@ -224,8 +267,19 @@ async function runTests() {
         headers: { authorization: `Bearer ${adminToken}` },
       });
       assert(res.status === 200, 'GET /api/bookings returns 200');
-      assert(Array.isArray(res.body.data), 'Returns list of bookings array');
-      assert(res.body.data.some(b => b._id.toString() === createdBookingId.toString()), 'Contains created booking');
+      assert(
+        Array.isArray(res.body.data),
+        'Returns list of bookings array'
+      );
+
+      assert(
+        Array.isArray(res.body.data) &&
+        createdBookingId &&
+        res.body.data.some(
+          b => b._id?.toString() === createdBookingId.toString()
+        ),
+        'Contains created booking'
+      );
     }
 
     {
