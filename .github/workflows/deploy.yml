@@ -92,7 +92,7 @@ jobs:
 
       - name: Deploy CloudFormation Stack (Create or Update EC2)
         id: cfn
-        uses: aws-actions/aws-cloudformation-stack-deploy@v1
+       uses: aws-actions/aws-cloudformation-github-deploy@v2.0.0
         with:
           name: ${{ env.STACK_NAME }}
           template: infra/ec2-instance.yaml
