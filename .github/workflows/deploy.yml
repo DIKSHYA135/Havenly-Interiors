@@ -187,16 +187,10 @@ jobs:
             cloud-init status --wait || true
 
             echo ">>> [2/8] Pulling latest code into /var/www/app..."
-            if [ ! -d "/var/www/app/.git" ]; then
-              sudo rm -rf /var/www/app
-              sudo mkdir -p /var/www/app
-              sudo chown ubuntu:ubuntu /var/www/app
-              git clone https://github.com/${{ github.repository }}.git /var/www/app
-            else
-              cd /var/www/app
-              git fetch origin main
-              git reset --hard origin/main
-            fi
+            sudo rm -rf /var/www/app
+            sudo mkdir -p /var/www/app
+            sudo chown ubuntu:ubuntu /var/www/app
+            git clone --depth 1 --branch main https://github.com/${{ github.repository }}.git /var/www/app 2>&1
 
             echo ">>> [3/8] Installing backend production dependencies..."
             cd /var/www/app/backend
