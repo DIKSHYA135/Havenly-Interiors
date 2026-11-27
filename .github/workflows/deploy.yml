@@ -186,11 +186,41 @@ jobs:
             echo ">>> [1/8] Waiting for EC2 user-data initialization..."
             cloud-init status --wait || true
 
-            echo ">>> [2/8] Pulling latest code into /var/www/app..."
-            sudo rm -rf /var/www/app
-            sudo mkdir -p /var/www/app
-            sudo chown ubuntu:ubuntu /var/www/app
-            git clone --depth 1 --branch main https://github.com/${{ github.repository }}.git /var/www/app 2>&1
+      
+
+            echo ">>> [2/8] Pulling latest code..."
+
+             APP_DIR="/var/www/app"
+             NEW_DIR="/var/www/app-new"
+
+              # Preserve existing .env
+            if [ -f "$APP_DIR/backend/.env" ]; then
+             sudo cp "$APP_DIR/backend/.env" /tmp/havenly-backend.env
+            sudo chmod 600 /tmp/havenly-backend.env
+             fi
+
+              # Clean previous temporary clone
+              sudo rm -rf "$NEW_DIR"
+
+              #Clone latest code
+              git clone --depth 1 \
+            --branch main \
+             "https://github.com/${{ github.repository }}.git" \
+              "$NEW_DIR" 2>&1
+
+               # Restore .env
+                if [ -f /tmp/havenly-backend.env ]; then
+                 sudo install -m 600 /tmp/havenly-backend.env "$NEW_DIR/backend/.env"
+               sudo rm -f /tmp/havenly-backend.env
+            fi
+
+                # Replace old application
+            sudo rm -rf "$APP_DIR"
+             sudo mv "$NEW_DIR" "$APP_DIR"
+              sudo chown -R ubuntu:ubuntu "$APP_DIR"
+
+                  echo "Code pulled successfully."
+    
 
             echo ">>> [3/8] Installing backend production dependencies..."
             cd /var/www/app/backend

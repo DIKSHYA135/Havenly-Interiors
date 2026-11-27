@@ -1,8 +1,14 @@
 import mongoose from 'mongoose';
 
 /**
+ * Cached connection promise for serverless environments (Vercel).
+ * Prevents opening a new connection on every function invocation.
+ */
+let cachedConnection = null;
+
+/**
  * Connect to MongoDB (Atlas or Local) via Mongoose.
- * Validates MONGODB_URI environment variable and establishes persistent connection.
+ * Uses connection caching for Vercel serverless functions.
  */
 export const connectDB = async () => {
   const uri = process.env.MONGODB_URI?.trim();
@@ -17,15 +23,28 @@ export const connectDB = async () => {
     return false;
   }
 
-  // If already connected
+  // If already connected, reuse the connection
   if (mongoose.connection.readyState === 1) {
     return true;
   }
 
+  // If a connection attempt is in progress, wait for it (serverless caching)
+  if (cachedConnection) {
+    try {
+      await cachedConnection;
+      return mongoose.connection.readyState === 1;
+    } catch {
+      cachedConnection = null;
+    }
+  }
+
   try {
-    await mongoose.connect(uri, {
+    cachedConnection = mongoose.connect(uri, {
       serverSelectionTimeoutMS: 5000,
+      bufferCommands: false, // Fail fast in serverless instead of buffering
     });
+
+    await cachedConnection;
 
     const host = mongoose.connection.host || '127.0.0.1';
     const dbName = mongoose.connection.name || 'havenly_interiors';
@@ -36,6 +55,7 @@ export const connectDB = async () => {
     console.log('============================================================\n');
     return true;
   } catch (error) {
+    cachedConnection = null;
     console.error('\n============================================================');
     console.error('❌ MongoDB Connection Error:', error.message);
     console.error('   Please verify:');

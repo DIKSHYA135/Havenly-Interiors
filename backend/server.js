@@ -182,7 +182,9 @@ const startServer = async () => {
   });
 };
 
-// Start the server
-startServer();
+// Start the server only when NOT running as a Vercel serverless function
+if (!process.env.VERCEL) {
+  startServer();
+}
 
 export default app;
